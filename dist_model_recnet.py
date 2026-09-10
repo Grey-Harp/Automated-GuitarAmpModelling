@@ -1,3 +1,4 @@
+import reference_training as reference
 import CoreAudioML.miscfuncs as miscfuncs
 import numpy as np
 import random
@@ -52,6 +53,8 @@ def main(args):
         for parameters in configs:
             args.__setattr__(parameters, configs[parameters])
 
+    reference.configure(args)
+
     if args.model == 'SimpleRNN':
         model_name = args.model + args.device + '_' + args.unit_type + '_hs' + str(args.hidden_size) + '_pre_' + args.pre_filt
     if args.pre_filt == 'A-Weighting':
@@ -72,6 +75,8 @@ def main(args):
     # Check if an existing saved model exists, and load it, otherwise creates a new model
     network = init_model(save_path, args)
 
+    reference.initial(network)
+
     # Check if a cuda device is available
     if not torch.cuda.is_available() or args.cuda == 0:
         print('cuda device not available/not selected')
@@ -85,10 +90,12 @@ def main(args):
 
     # Set up training optimiser + scheduler + loss fcns and training info tracker
     optimiser = torch.optim.Adam(network.parameters(), lr=args.learn_rate, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimiser, 'min', factor=0.5, patience=5, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimiser, 'min', factor=0.5, patience=5)
     loss_functions = training.LossWrapper(args.loss_fcns, args.pre_filt)
     train_track = training.TrainTrack()
-    writer = SummaryWriter(os.path.join('TensorboardData', model_name))
+    writer = SummaryWriter(os.path.join(save_path, 'tensorboard'))
+
+    reference.setup(args, network, optimiser, scheduler)
 
     # Load dataset
     dataset = CAMLdataset.DataSet(data_dir='Data')
@@ -104,6 +111,8 @@ def main(args):
     # Set network save_state flag to true, so when the save_model method is called the network weights are saved
     network.save_state = True
     patience_counter = 0
+
+    reference.train_start(args)
 
     # This is where training happens
     # the network records the last epoch number, so if training is restarted it will start at the correct epoch number
@@ -125,7 +134,7 @@ def main(args):
                                              dataset.subsets['val'].data['target'][0], loss_functions, args.val_chunk)
             scheduler.step(val_loss)
             print("Val loss:", val_loss)
-            if val_loss < train_track['best_val_loss']:
+            if val_loss < train_track['best_val_loss'] * 0.999:
                 patience_counter = 0
                 network.save_model('model_best', save_path)
                 write(os.path.join(save_path, "best_val_out.wav"),
@@ -142,6 +151,7 @@ def main(args):
         writer.add_scalar('TrainingAndValidation/LearningRate', optimiser.param_groups[0]['lr'], epoch)
         network.save_model('model', save_path)
         miscfuncs.json_save(train_track, 'training_stats', save_path)
+        reference.checkpoint(save_path)
 
         if args.validation_p and patience_counter > args.validation_p:
             print('validation patience limit reached at epoch ' + str(epoch))
@@ -195,6 +205,7 @@ def main(args):
     print("Finished Training: " + model_name)
 
     miscfuncs.json_save(train_track, 'training_stats', save_path)
+    reference.checkpoint(save_path)
     if cuda:
         with open(os.path.join(save_path, 'maxmemusage.txt'), 'w') as f:
             f.write(str(torch.cuda.max_memory_allocated()))
@@ -269,12 +280,6 @@ if __name__ == "__main__":
     prsr.add_argument('--skip_con', '-sc', default=1, help='is there a skip connection for the input to the output')
 
     args = prsr.parse_args()
-
-    if args.seed:
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        random.seed(args.seed)
-
 
     main(args)
 

@@ -192,12 +192,12 @@ def conditionedWavParse(args):
     params = data["Number of Parameters"]
 
     # Load and Preprocess Data ###########################################
-    all_clean_train = np.array([[]]*(params+1)) # 1 channel for audio, n channels per parameters
-    all_clean_val = np.array([[]]*(params+1)) # 1 channel for audio, n channels per parameters
-    all_clean_test = np.array([[]]*(params+1)) # 1 channel for audio, n channels per parameters
-    all_target_train = np.array([[]]) # 1 channels of all (out audio)
-    all_target_val = np.array([[]]) # 1 channels of all (out audio)
-    all_target_test = np.array([[]]) # 1 channels of all (out audio)
+    all_clean_train = np.empty((params + 1, 0), dtype=np.float32) # 1 channel for audio, n channels per parameters
+    all_clean_val = np.empty((params + 1, 0), dtype=np.float32) # 1 channel for audio, n channels per parameters
+    all_clean_test = np.empty((params + 1, 0), dtype=np.float32) # 1 channel for audio, n channels per parameters
+    all_target_train = np.empty((1, 0), dtype=np.float32) # 1 channels of all (out audio)
+    all_target_val = np.empty((1, 0), dtype=np.float32) # 1 channels of all (out audio)
+    all_target_test = np.empty((1, 0), dtype=np.float32) # 1 channels of all (out audio)
 
 
     for ds in data["Data Sets"]:
@@ -247,9 +247,9 @@ def conditionedWavParse(args):
         # Create a list of np arrays of the parameter values
         for val in ds["Parameters"]:
             # Create the parameter arrays
-            params_train.append(np.array([val]*len(in_train)))
-            params_val.append(np.array([val]*len(in_val)))
-            params_test.append(np.array([val]*len(in_test)))
+            params_train.append(np.full(len(in_train), val, dtype=np.float32))
+            params_val.append(np.full(len(in_val), val, dtype=np.float32))
+            params_test.append(np.full(len(in_test), val, dtype=np.float32))
 
         # Convert the lists to numpy arrays
         params_train = np.array(params_train)

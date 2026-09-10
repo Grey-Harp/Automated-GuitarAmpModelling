@@ -1,3 +1,5 @@
+Maintained fork: see [FORK.md](FORK.md) for the active changes and tests.
+
 # Automated-Guitar Amplifier Modelling
 
 ## GuitarML Fork

@@ -44,3 +44,6 @@ Data/*
 !Data/val/muff-target.wav
 Recordings/
 runs2/
+
+__pycache__/
+*.pyc
