@@ -19,6 +19,9 @@ from scipy.io.wavfile import write
 # from it, after checking the network in 'model.json' matches the architecture described in args. If no model file is
 # found, it creates a network according to the specification in args.
 def init_model(save_path, args):
+    if reference.resuming():
+        return networks.SimpleRNN(input_size=args.input_size, unit_type=args.unit_type,
+                                  hidden_size=args.hidden_size, output_size=args.output_size, skip=args.skip_con)
     # Search for an existing model in the save directory
     if miscfuncs.file_check('model.json', save_path) and args.load_model:
         print('existing model file found, loading network')
@@ -53,6 +56,8 @@ def main(args):
         for parameters in configs:
             args.__setattr__(parameters, configs[parameters])
 
+    save_path = os.path.join(args.save_location, args.device + '-' + args.load_config)
+    reference.prepare_resume_result(save_path)
     reference.configure(args)
 
     if args.model == 'SimpleRNN':
@@ -113,10 +118,22 @@ def main(args):
     patience_counter = 0
 
     reference.train_start(args)
+    continuation = reference.continuation_contract(args, network)
+    training_complete = False
+    if reference.resuming():
+        patience_counter, training_complete = reference.restore_training_state(
+            save_path, network, optimiser, scheduler, train_track, continuation)
+        # TrainTrack's legacy timing calculation is retained; wall times are not
+        # part of numerical equivalence or the cloud resource budget.
+        init_time = time.time() - start_time + train_track['total_time']*3600
+    session_started = time.monotonic()
+    reference.pause_requested(0, session_started)  # Reject malformed limits before training.
 
     # This is where training happens
     # the network records the last epoch number, so if training is restarted it will start at the correct epoch number
     for epoch in range(train_track['current_epoch'] + 1, args.epochs + 1):
+        if training_complete:
+            break
         print("Epoch: ", epoch)
         ep_st_time = time.time()
 
@@ -151,11 +168,29 @@ def main(args):
         writer.add_scalar('TrainingAndValidation/LearningRate', optimiser.param_groups[0]['lr'], epoch)
         network.save_model('model', save_path)
         miscfuncs.json_save(train_track, 'training_stats', save_path)
+        training_complete = epoch >= args.epochs or bool(args.validation_p and patience_counter > args.validation_p)
+        reference.save_training_state(save_path, network, optimiser, scheduler, train_track,
+                                      patience_counter, continuation, training_complete)
         reference.checkpoint(save_path)
 
         if args.validation_p and patience_counter > args.validation_p:
             print('validation patience limit reached at epoch ' + str(epoch))
             break
+        if not training_complete and reference.pause_requested(epoch, session_started):
+            writer.flush()
+            writer.close()
+            print('TRAINING_PAUSED: completed epoch ' + str(epoch), flush=True)
+            return reference.PAUSED_EXIT_CODE
+
+    # Immutable epoch snapshots carry best weights, not another copy of a long
+    # validation WAV on every epoch. Recreate that export once when finishing.
+    if not os.path.isfile(os.path.join(save_path, 'best_val_out.wav')):
+        best_for_validation = networks.load_model(miscfuncs.json_load('model_best', save_path))
+        best_output, _ = best_for_validation.process_data(dataset.subsets['val'].data['input'][0],
+            dataset.subsets['val'].data['target'][0], loss_functions, args.val_chunk)
+        write(os.path.join(save_path, 'best_val_out.wav'), dataset.subsets['val'].fs,
+              best_output.cpu().numpy()[:, 0, 0])
+        del best_for_validation, best_output
 
     # Remove dataset from memory
     del dataset
@@ -205,10 +240,14 @@ def main(args):
     print("Finished Training: " + model_name)
 
     miscfuncs.json_save(train_track, 'training_stats', save_path)
+    reference.finish_training_state(save_path)
     reference.checkpoint(save_path)
     if cuda:
         with open(os.path.join(save_path, 'maxmemusage.txt'), 'w') as f:
             f.write(str(torch.cuda.max_memory_allocated()))
+    writer.flush()
+    writer.close()
+    return 0
 
 
 
@@ -281,6 +320,4 @@ if __name__ == "__main__":
 
     args = prsr.parse_args()
 
-    main(args)
-
-
+    raise SystemExit(main(args))

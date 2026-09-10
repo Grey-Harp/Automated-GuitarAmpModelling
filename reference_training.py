@@ -37,6 +37,13 @@ def audit_arguments(args):
     if actual != expected:
         keys = sorted(k for k in set(actual) | set(expected) if actual.get(k) != expected.get(k))
         raise SpecError('Trainer effective arguments differ: ' + ', '.join(keys))
+    if resuming():
+        verify_provenance(os.environ['PET_PROVENANCE_DIR'], os.environ['PET_RUN_ID'], args.seed)
+        previous = read(Path(os.environ['PET_PROVENANCE_DIR']) / 'effective_config.json')['arguments']
+        if numerical_arguments(previous) != numerical_arguments(actual):
+            raise SpecError('Resume configuration differs from original initialization')
+        apply_seed(args.seed, record=False)
+        return
     apply_seed(args.seed)
     folder = Path(os.environ['PET_PROVENANCE_DIR'])
     write(folder / 'effective_config.json', {'arguments': actual, 'run_id': os.environ['PET_RUN_ID']})
@@ -53,7 +60,7 @@ def rng_state():
             'torch_cuda': [state.tolist() for state in torch.cuda.get_rng_state_all()] if torch.cuda.is_available() else []}
 
 
-def apply_seed(seed):
+def apply_seed(seed, record=True):
     if type(seed) is not int or not 0 <= seed < 2**32:
         raise SpecError('Seed must be an explicit uint32 (zero is valid)')
     if os.environ.get('PYTHONHASHSEED') != str(seed):
@@ -84,7 +91,8 @@ def apply_seed(seed):
                'cuda_matmul_allow_tf32': torch.backends.cuda.matmul.allow_tf32,
                'cudnn_allow_tf32': torch.backends.cudnn.allow_tf32,
                'rng': rng_state()}
-    write(Path(os.environ['PET_PROVENANCE_DIR']) / 'seed_receipt.json', receipt)
+    if record:
+        write(Path(os.environ['PET_PROVENANCE_DIR']) / 'seed_receipt.json', receipt)
 
 
 def capture_initial(network):
@@ -203,15 +211,15 @@ def configure(args):
 
 
 def initial(network):
-    if reference_enabled(): capture_initial(network)
+    if reference_enabled() and not resuming(): capture_initial(network)
 
 
 def setup(args, network, optimiser, scheduler):
-    if reference_enabled(): audit_setup(args, network, optimiser, scheduler)
+    if reference_enabled() and not resuming(): audit_setup(args, network, optimiser, scheduler)
 
 
 def train_start(args):
-    if reference_enabled(): capture_train_start(args)
+    if reference_enabled() and not resuming(): capture_train_start(args)
 
 
 def checkpoint(save_path):
@@ -221,3 +229,197 @@ def checkpoint(save_path):
     if not separator or not all(part.isidentifier() for part in module.split('.')) or not name.isidentifier():
         raise SpecError('Checkpoint callback must be module:function')
     getattr(importlib.import_module(module), name)(save_path)
+
+
+# Continuation is explicit and only at a completed epoch boundary. JSON exports
+# remain usable by plugins; this separate file is the training state.
+RESUME_STATE = 'training_state.pt'
+RESUME_MANIFEST = 'training_state.json'
+PAUSED_EXIT_CODE = 75
+
+
+def resuming():
+    return bool(os.environ.get('PET_RESUME_DIR'))
+
+
+def numerical_arguments(arguments):
+    # Locations may differ on another machine. Everything controlling training,
+    # including the total epoch limit and seed, must be identical.
+    return {k: v for k, v in arguments.items()
+            if k not in ('save_location', 'config_location', 'load_config')}
+
+
+def restore_rng(state):
+    import random
+    import numpy as np
+    import torch
+    def tuples(value):
+        return tuple(tuples(v) for v in value) if isinstance(value, list) else value
+    random.setstate(tuples(state['python']))
+    n = state['numpy']
+    np.random.set_state((n[0], np.asarray(n[1], dtype=np.uint32), *n[2:]))
+    torch.set_rng_state(torch.tensor(state['torch_cpu'], dtype=torch.uint8, device='cpu'))
+    if len(state['torch_cuda']) != torch.cuda.device_count():
+        raise SpecError('CUDA RNG device count differs')
+    if state['torch_cuda']:
+        torch.cuda.set_rng_state_all([torch.tensor(v, dtype=torch.uint8, device='cpu') for v in state['torch_cuda']])
+
+
+def continuation_environment(network):
+    import platform
+    import numpy as np
+    import torch
+    device = next(network.parameters()).device
+    return {'python': platform.python_version(), 'numpy': str(np.__version__), 'torch': str(torch.__version__),
+            'device': str(device), 'cuda': torch.version.cuda, 'cudnn': torch.backends.cudnn.version(),
+            'gpu_names': [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+            'deterministic': torch.are_deterministic_algorithms_enabled(),
+            'cudnn_benchmark': torch.backends.cudnn.benchmark,
+            'cudnn_deterministic': torch.backends.cudnn.deterministic,
+            'matmul_tf32': torch.backends.cuda.matmul.allow_tf32,
+            'cudnn_tf32': torch.backends.cudnn.allow_tf32,
+            'threads': torch.get_num_threads(), 'interop_threads': torch.get_num_interop_threads()}
+
+
+def continuation_contract(args, network):
+    source = Path(__file__).resolve().parent
+    sources = ('reference_training.py', 'dist_model_recnet.py', 'CoreAudioML/networks.py',
+               'CoreAudioML/training.py', 'CoreAudioML/dataset.py', 'CoreAudioML/miscfuncs.py')
+    files = [Path('Data') / sub / (args.file_name + '-' + kind + '.wav')
+             for sub in ('train', 'val', 'test') for kind in ('input', 'target')]
+    result = {'arguments': numerical_arguments(vars(args)),
+              'sources': {p: digest(source / p) for p in sources},
+              'data': {str(p): digest(p) for p in files},
+              'environment': continuation_environment(network),
+              'run_id': os.environ.get('PET_RUN_ID')}
+    if reference_enabled():
+        result['initialization_sha256'] = digest(Path(os.environ['PET_PROVENANCE_DIR']) / 'initialization.json')
+    return result
+
+
+def verify_training_state(folder):
+    """Verify bytes before torch deserialization, also usable without torch on a client."""
+    folder = Path(folder)
+    if (folder/RESUME_MANIFEST).is_symlink():
+        raise SpecError('Training manifest must not be a symlink')
+    m = read(folder / RESUME_MANIFEST)
+    if m.get('schema') != 1 or m.get('boundary') != 'epoch_complete':
+        raise SpecError('Unknown training checkpoint schema/boundary')
+    required = {RESUME_STATE, 'model.json', 'training_stats.json'}
+    if m.get('has_best'): required.add('model_best.json')
+    if set(m.get('files', {})) != required:
+        raise SpecError('Incomplete training checkpoint manifest')
+    if type(m.get('epoch')) is not int or m['epoch'] < 1:
+        raise SpecError('Invalid checkpoint epoch')
+    for name, expected in m['files'].items():
+        if (folder/name).is_symlink() or digest(folder/name) != expected:
+            raise SpecError('Training checkpoint changed: ' + name)
+    stats = read(folder/'training_stats.json')
+    if stats['current_epoch'] != m['epoch'] or len(stats['training_losses']) != m['epoch']:
+        raise SpecError('Checkpoint epoch and statistics disagree')
+    return m
+
+
+def save_training_state(folder, network, optimiser, scheduler, track, patience, contract, training_complete):
+    import torch
+    folder = Path(folder)
+    if network.hidden is not None:
+        raise SpecError('Only completed epochs with reset recurrent state can be saved')
+    state = {'schema': 1, 'model': network.state_dict(), 'optimizer': optimiser.state_dict(),
+             'scheduler': scheduler.state_dict(), 'track': dict(track), 'patience': patience,
+             'rng': rng_state(), 'contract': contract, 'training_complete': bool(training_complete)}
+    # The manifest is published last; a crash leaves a rejected mixed pair, while
+    # the previous immutable orchestration snapshot remains intact.
+    temporary = folder/(RESUME_STATE+'.tmp')
+    torch.save(state, temporary)
+    os.replace(temporary, folder/RESUME_STATE)
+    names = [RESUME_STATE, 'model.json', 'training_stats.json']
+    has_best = (folder/'model_best.json').is_file()
+    if has_best: names.append('model_best.json')
+    write(folder/RESUME_MANIFEST, {'schema': 1, 'boundary': 'epoch_complete',
+          'epoch': track['current_epoch'], 'has_best': has_best,
+          'training_complete': bool(training_complete), 'finalized': False,
+          'files': {name: digest(folder/name) for name in names}})
+    verify_training_state(folder)
+
+
+def restore_training_state(folder, network, optimiser, scheduler, track, contract):
+    import torch
+    folder = Path(folder)
+    manifest = verify_training_state(folder)
+    if manifest.get('finalized'):
+        raise SpecError('Completed result cannot start another training session')
+    # Only tensor/primitive state from our hash-verified artifact, never arbitrary
+    # Python objects from a pickle checkpoint.
+    state = torch.load(folder/RESUME_STATE, map_location='cpu', weights_only=True)
+    if state.get('schema') != 1 or state.get('contract') != contract:
+        raise SpecError('Resume data, arguments, sources, environment or run identity differs')
+    if state['track'] != read(folder/'training_stats.json'):
+        raise SpecError('Resume state and statistics disagree')
+    if state['training_complete'] != manifest['training_complete']:
+        raise SpecError('Resume termination state disagrees')
+    if type(state['patience']) is not int or state['patience'] < 0:
+        raise SpecError('Invalid early stopping state')
+    exported = read(folder/'model.json')['state_dict']
+    if set(exported) != set(state['model']):
+        raise SpecError('Training state and exported model keys disagree')
+    for name, tensor in state['model'].items():
+        if not torch.isfinite(tensor).all() or not torch.equal(
+                tensor, torch.tensor(exported[name], dtype=tensor.dtype, device='cpu')):
+            raise SpecError('Training state and exported model weights disagree')
+    network.load_state_dict(state['model'], strict=True)
+    optimiser.load_state_dict(state['optimizer'])
+    scheduler.load_state_dict(state['scheduler'])
+    track.restore_data(state['track'])
+    network.reset_hidden()
+    restore_rng(state['rng'])  # Last: initialization and data loading may consume RNG.
+    return state['patience'], state['training_complete']
+
+
+def prepare_resume_result(save_path):
+    """Copy into an empty destination, retaining the original initialization."""
+    import shutil
+    if not resuming(): return
+    source, target = Path(os.environ['PET_RESUME_DIR']).resolve(), Path(save_path).resolve()
+    verify_training_state(source)
+    if source == target or target.exists():
+        raise SpecError('Resume requires a new, empty result directory')
+    target.mkdir(parents=True)
+    for name in verify_training_state(source)['files']:
+        shutil.copyfile(source/name, target/name)
+    shutil.copyfile(source/RESUME_MANIFEST, target/RESUME_MANIFEST)
+    if (source/'provenance').is_dir():
+        shutil.copytree(source/'provenance', target/'provenance')
+    # A carried best output is useful before a later validation improves it.
+    if (source/'best_val_out.wav').is_file():
+        shutil.copyfile(source/'best_val_out.wav', target/'best_val_out.wav')
+    verify_training_state(target)
+
+
+def finish_training_state(folder):
+    """Mark final tests complete without replacing the saved final model with best."""
+    import torch
+    folder = Path(folder)
+    m = read(folder/RESUME_MANIFEST)
+    if not m['training_complete']:
+        raise SpecError('Cannot finalize unfinished training')
+    state = torch.load(folder/RESUME_STATE, map_location='cpu', weights_only=True)
+    state['track'] = read(folder/'training_stats.json')
+    temporary = folder/(RESUME_STATE+'.tmp')
+    torch.save(state, temporary)
+    os.replace(temporary, folder/RESUME_STATE)
+    m['finalized'] = True
+    m['files'] = {name: digest(folder/name) for name in m['files']}
+    write(folder/RESUME_MANIFEST, m)
+    verify_training_state(folder)
+
+
+def pause_requested(epoch, started):
+    import time
+    stop_epoch = os.environ.get('PET_PAUSE_AFTER_EPOCH')
+    seconds = os.environ.get('PET_PAUSE_AFTER_SECONDS')
+    for value in (stop_epoch, seconds):
+        if value is not None and (not value.isdigit() or int(value) <= 0):
+            raise SpecError('Pause limits must be positive integers')
+    return ((stop_epoch is not None and epoch >= int(stop_epoch)) or
+            (seconds is not None and time.monotonic()-started >= int(seconds)))

@@ -34,12 +34,44 @@ and remains outside this repository. Callback failure propagates to the caller.
 Known boundaries retained from the accepted version: validation/test sequences
 must be at least one chunk; the training frame is hardcoded to 22050 samples;
 `segment_length`, `data_location`, `iter_num`, and `num_blocks` do not control
-those parts of this trainer. Training state is not fully resumed from weights.
+those parts of this trainer. Weight-only loading does not restore training state; explicit continuation is described below.
 CPU reproducibility tests do not guarantee identical GPU results.
 
 Tests from repository root (with submodule initialized and dependencies present):
 
-    python -B -m unittest discover -s tests
+    python -B -m unittest discover -s tests -p test_reference_training.py
     python -B -m unittest discover -s CoreAudioML/tests
 
 Licenses and upstream attribution are retained in LICENSE.md and README.md.
+
+## Full-state continuation
+
+`dist_model_recnet.py` now writes `training_state.pt` and a hash manifest
+`training_state.json` after each completed epoch. These contain current model,
+Adam, ReduceLROnPlateau, TrainTrack, patience and Python/NumPy/torch CPU/CUDA
+RNG states. Recurrent hidden state must be reset at this boundary. The manifest
+binds the model exports and statistics to the tensor state. Initial provenance
+is retained, not regenerated on continuation.
+
+Set `PET_RESUME_DIR` to a verified immutable checkpoint directory and use a new
+empty output directory. The original logical `PET_RUN_ID`, numerical arguments,
+all six prepared data files, source code and runtime settings must match.
+Resume uses `torch.load(..., weights_only=True)` after hash verification.
+Old weight-only snapshots are deliberately rejected. Finished results cannot
+start new training; a checkpoint at a training-complete boundary can finish its
+pending final tests without running another epoch.
+
+`PET_PAUSE_AFTER_EPOCH` or `PET_PAUSE_AFTER_SECONDS` requests a pause at an
+epoch boundary; exit code 75 means paused, not completed. Limits must be positive
+integers. No final tests are performed at a pause. The cloud callback must copy
+both training-state files, model exports, stats and provenance before declaring
+an attempt recoverable. Hard VM loss can still discard work after the last
+confirmed remote snapshot. CPU equivalence does not certify a CUDA continuation.
+
+The older statement above about incomplete weight-only resume applies to old
+snapshots and the legacy `load_model` path, not this explicit full-state path.
+
+The `test_training_resume.py` integration suite runs from the containing Pet-Sim
+checkout: it uses its frozen specification, Colab snapshot callback and the
+previous maintained trainer commit as a numerical control. Run it through
+`Colab/verify_continuation.py` with an explicit report output path.
