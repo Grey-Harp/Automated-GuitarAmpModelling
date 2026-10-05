@@ -75,3 +75,23 @@ The `test_training_resume.py` integration suite runs from the containing Pet-Sim
 checkout: it uses its frozen specification, Colab snapshot callback and the
 previous maintained trainer commit as a numerical control. Run it through
 `Colab/verify_continuation.py` with an explicit report output path.
+
+## Fixed-terminal paired warm start
+
+`gain_balance.py` implements a separate DS1 gain-balanced experiment. It reads
+only hash-pinned initial weights, creates fresh Adam state, and keeps C/T model
+and RNG states separate. A saved CPU permutation plan is shared by both arms;
+C then T execute each epoch. The legacy files and finalized-resume prohibition
+are unchanged. C calls the pinned LossWrapper. T filters the whole update
+before grouping samples by Gain, including transitions inside a segment.
+
+Snapshots contain both arms, optimizer/RNG/history and the plan. Terminal
+exports require completion of both fixed endpoints; validation cannot select
+weights or change training order. The containing project owns data identity,
+authorization, resource limits and remote snapshot handling. No cloud or data
+paths are embedded in this module. CPU controls include independent finite
+differences, real legacy Adam updates, C/C identity, and paired recovery.
+
+    python -B -m unittest discover -s tests -p test_gain_balance.py -v
+
+CPU equivalence does not certify CUDA equivalence, speed or sound quality.
